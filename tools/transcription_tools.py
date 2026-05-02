@@ -313,7 +313,7 @@ def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
+def _transcribe_local(file_path: str, model_name: str, initial_prompt: Optional[str] = None) -> Dict[str, Any]:
     """Transcribe using faster-whisper (local, free)."""
     global _local_model, _local_model_name
 
@@ -324,8 +324,16 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         from faster_whisper import WhisperModel
         # Lazy-load the model (downloads on first use, ~150 MB for 'base')
         if _local_model is None or _local_model_name != model_name:
-            logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-            _local_model = WhisperModel(model_name, device="auto", compute_type="auto")
+            local_cfg = _load_stt_config().get("local", {})
+            device = str(local_cfg.get("device") or os.getenv("HERMES_LOCAL_STT_DEVICE") or "auto").strip()
+            compute_type = str(local_cfg.get("compute_type") or os.getenv("HERMES_LOCAL_STT_COMPUTE_TYPE") or "auto").strip()
+            logger.info(
+                "Loading faster-whisper model '%s' on device=%s compute_type=%s (first load downloads the model)...",
+                model_name,
+                device,
+                compute_type,
+            )
+            _local_model = WhisperModel(model_name, device=device, compute_type=compute_type)
             _local_model_name = model_name
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
@@ -337,6 +345,8 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         transcribe_kwargs = {"beam_size": 5}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
+        if initial_prompt:
+            transcribe_kwargs["initial_prompt"] = initial_prompt
 
         segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
         transcript = " ".join(segment.text.strip() for segment in segments)
@@ -445,7 +455,7 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
+def _transcribe_groq(file_path: str, model_name: str, initial_prompt: Optional[str] = None) -> Dict[str, Any]:
     """Transcribe using Groq Whisper API (free tier available)."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -464,11 +474,14 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
         client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model=model_name,
-                    file=audio_file,
-                    response_format="text",
-                )
+                kwargs = {
+                    "model": model_name,
+                    "file": audio_file,
+                    "response_format": "text",
+                }
+                if initial_prompt:
+                    kwargs["prompt"] = initial_prompt
+                transcription = client.audio.transcriptions.create(**kwargs)
 
             transcript_text = str(transcription).strip()
             logger.info("Transcribed %s via Groq API (%s, %d chars)",
@@ -497,7 +510,7 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
+def _transcribe_openai(file_path: str, model_name: str, initial_prompt: Optional[str] = None) -> Dict[str, Any]:
     """Transcribe using OpenAI Whisper API (paid)."""
     try:
         api_key, base_url = _resolve_openai_audio_client_config()
@@ -521,11 +534,14 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model=model_name,
-                    file=audio_file,
-                    response_format="text" if model_name == "whisper-1" else "json",
-                )
+                kwargs = {
+                    "model": model_name,
+                    "file": audio_file,
+                    "response_format": "text" if model_name == "whisper-1" else "json",
+                }
+                if initial_prompt:
+                    kwargs["prompt"] = initial_prompt
+                transcription = client.audio.transcriptions.create(**kwargs)
 
             transcript_text = _extract_transcript_text(transcription)
             logger.info("Transcribed %s via OpenAI API (%s, %d chars)",
@@ -593,7 +609,7 @@ def _transcribe_mistral(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
+def _transcribe_xai(file_path: str, model_name: str, initial_prompt: Optional[str] = None) -> Dict[str, Any]:
     """Transcribe using xAI Grok STT API.
 
     Uses the ``POST /v1/stt`` REST endpoint with multipart/form-data.
@@ -632,6 +648,10 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
             data["format"] = "true"
         if use_diarize:
             data["diarize"] = "true"
+        if initial_prompt:
+            # xAI's STT endpoint accepts normal multipart form fields; keep this
+            # optional so providers that ignore it still transcribe normally.
+            data["prompt"] = initial_prompt
 
         with open(file_path, "rb") as audio_file:
             response = requests.post(
@@ -692,7 +712,11 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    initial_prompt: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
 
@@ -703,6 +727,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     Args:
         file_path: Absolute path to the audio file to transcribe.
         model:     Override the model. If None, uses config or provider default.
+        initial_prompt: Optional context prompt for Whisper-compatible providers.
 
     Returns:
         dict with keys:
@@ -732,7 +757,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = _normalize_local_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
-        return _transcribe_local(file_path, model_name)
+        return _transcribe_local(file_path, model_name, initial_prompt=initial_prompt)
 
     if provider == "local_command":
         local_cfg = stt_config.get("local", {})
@@ -742,13 +767,14 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         return _transcribe_local_command(file_path, model_name)
 
     if provider == "groq":
-        model_name = model or DEFAULT_GROQ_STT_MODEL
-        return _transcribe_groq(file_path, model_name)
+        groq_cfg = stt_config.get("groq", {})
+        model_name = model or groq_cfg.get("model", DEFAULT_GROQ_STT_MODEL)
+        return _transcribe_groq(file_path, model_name, initial_prompt=initial_prompt)
 
     if provider == "openai":
         openai_cfg = stt_config.get("openai", {})
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
-        return _transcribe_openai(file_path, model_name)
+        return _transcribe_openai(file_path, model_name, initial_prompt=initial_prompt)
 
     if provider == "mistral":
         mistral_cfg = stt_config.get("mistral", {})
@@ -759,7 +785,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         xai_cfg = stt_config.get("xai", {})
         # xAI Grok STT doesn't use a model parameter — pass through for logging
         model_name = model or "grok-stt"
-        return _transcribe_xai(file_path, model_name)
+        return _transcribe_xai(file_path, model_name, initial_prompt=initial_prompt)
 
     # No provider available
     return {
