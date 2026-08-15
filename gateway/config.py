@@ -206,9 +206,11 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
 
 def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
     """Normalize notice delivery mode to a supported value."""
+    if value is False:
+        return "off"
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"public", "private"}:
+        if normalized in {"public", "private", "off"}:
             return normalized
     return default
 

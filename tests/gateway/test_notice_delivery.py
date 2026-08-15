@@ -1,10 +1,11 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _should_prompt_for_home_channel
 from gateway.session import SessionSource
 
 
@@ -32,11 +33,10 @@ def _make_runner(extra=None):
     return runner, adapter
 
 
-@pytest.mark.asyncio
-async def test_deliver_platform_notice_uses_private_delivery_when_configured():
+def test_deliver_platform_notice_uses_private_delivery_when_configured():
     runner, adapter = _make_runner(extra={"notice_delivery": "private"})
 
-    await runner._deliver_platform_notice(_make_source(), "hello")
+    asyncio.run(runner._deliver_platform_notice(_make_source(), "hello"))
 
     adapter.send_private_notice.assert_awaited_once_with(
         "C123",
@@ -47,3 +47,24 @@ async def test_deliver_platform_notice_uses_private_delivery_when_configured():
     adapter.send.assert_not_awaited()
 
 
+def test_deliver_platform_notice_is_silent_when_disabled():
+    runner, adapter = _make_runner(extra={"notice_delivery": False})
+
+    asyncio.run(runner._deliver_platform_notice(_make_source(), "hello"))
+
+    adapter.send_private_notice.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [
+        (Platform.EMAIL, False),
+        (Platform.LOCAL, False),
+        (Platform.WEBHOOK, False),
+        (Platform.TELEGRAM, True),
+        (Platform.SLACK, True),
+    ],
+)
+def test_home_channel_prompt_is_limited_to_interactive_chat_platforms(platform, expected):
+    assert _should_prompt_for_home_channel(platform) is expected

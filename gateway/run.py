@@ -1625,6 +1625,18 @@ def _home_target_env_var(platform_name: str) -> str:
     return f"{platform_name.upper()}_HOME_CHANNEL"
 
 
+def _should_prompt_for_home_channel(platform: object) -> bool:
+    """Return whether a platform supports interactive home-channel onboarding.
+
+    Email is an addressable transport, not a chat where ``/sethome`` is a
+    meaningful onboarding action. Sending the prompt by email creates an
+    unsolicited reply on every new thread when Email is intentionally
+    inbound-only.
+    """
+    platform_name = str(getattr(platform, "value", platform)).strip().lower()
+    return platform_name not in {"local", "webhook", "email"}
+
+
 def _home_thread_env_var(platform_name: str) -> str:
     """Return the optional thread/topic env var for a platform home target."""
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
@@ -13144,6 +13156,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         notice_delivery = "public"
         if config and hasattr(config, "get_notice_delivery"):
             notice_delivery = config.get_notice_delivery(source.platform)
+        if notice_delivery == "off":
+            return
 
         metadata = self._thread_metadata_for_source(source)
         if notice_delivery == "private" and getattr(source, "user_id", None):
@@ -16504,9 +16518,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 turn_sidecar_notes.append(_intro_note)
         
-        # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # One-time prompt if no home channel is set for an interactive chat
+        # platform. Addressable transports such as Email do not have a
+        # meaningful /sethome interaction and must not emit unsolicited mail.
+        if not history and source.platform and _should_prompt_for_home_channel(source.platform):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             # Multiplex: home channel may live only in the profile secret
