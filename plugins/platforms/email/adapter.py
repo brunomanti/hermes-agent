@@ -284,6 +284,7 @@ def _verify_sender_authentication(
     from_addr: str,
     *,
     authserv_id: str = "",
+    raw_email: Optional[bytes] = None,
 ) -> Tuple[bool, str]:
     """Verify that the message's ``From:`` domain is authenticated.
 
@@ -296,10 +297,10 @@ def _verify_sender_authentication(
     ``Authentication-Results`` an attacker injected into the body of their
     message sorts below it.
 
-    Returns ``(authenticated, reason)``. ``authenticated`` is True when:
-      * a DMARC pass is recorded for the From domain, OR
-      * an SPF pass aligned with the From domain, OR
-      * a DKIM pass aligned (``header.d``) with the From domain.
+    Returns ``(authenticated, reason)``. Authentication requires an aligned
+    DKIM signature verified directly from the raw message, or an aligned DKIM
+    pass stamped by an explicitly pinned receiving auth service. SPF and DMARC
+    without DKIM are not cryptographic proof of the author domain.
 
     When no ``Authentication-Results`` header is present at all, we return
     ``(False, "no Authentication-Results header")`` — fail-closed. Operators
@@ -310,13 +311,29 @@ def _verify_sender_authentication(
     if not from_domain:
         return False, "missing From domain"
 
+    if raw_email:
+        try:
+            import dkim
+
+            signature = msg.get("DKIM-Signature", "")
+            domain_match = re.search(r"(?:^|;)\s*d=([^;\s]+)", signature, re.IGNORECASE)
+            signing_domain = domain_match.group(1) if domain_match else ""
+            if dkim.verify(raw_email) and _domains_aligned(signing_domain, from_domain):
+                return True, "dkim=pass cryptographically verified"
+        except (ImportError, KeyError, TypeError, ValueError):
+            pass
+        except Exception as exc:
+            logger.warning("[Email] Direct DKIM verification failed: %s", exc)
+
     # get_all preserves header order; the receiving server prepends its result,
     # so the FIRST Authentication-Results is the trusted one. We pin to the
     # configured authserv-id when provided to defend against an injected header
     # that happens to sort first.
     headers = msg.get_all("Authentication-Results") or []
+    if not authserv_id:
+        return False, "no cryptographically verified aligned DKIM"
     if not headers:
-        return False, "no Authentication-Results header"
+        return False, "no Authentication-Results header from pinned auth service"
 
     trusted = None
     for raw in headers:
@@ -324,7 +341,7 @@ def _verify_sender_authentication(
         if authserv_id:
             # authserv-id is the first token before the first ';'
             serv = value.split(";", 1)[0].strip().lower()
-            if not _domains_aligned(serv, authserv_id) and serv != authserv_id.lower():
+            if serv != authserv_id.lower():
                 continue
         trusted = value
         break
@@ -334,29 +351,25 @@ def _verify_sender_authentication(
     methods = {m.lower(): r.lower() for m, r in _AUTH_METHOD_RE.findall(trusted)}
     props = {p.lower(): v.strip().strip('"') for p, v in _AUTH_PROP_RE.findall(trusted)}
 
-    # 1) DMARC pass is the strongest signal — DMARC already enforces From
-    #    alignment, so a pass means the From domain is authenticated.
-    if methods.get("dmarc") == "pass":
-        return True, "dmarc=pass"
-
-    # 2) SPF pass aligned with the From domain (the envelope/MAIL FROM domain
-    #    must match the From domain).
-    if methods.get("spf") == "pass":
-        spf_domain = _domain_of(props.get("smtp.mailfrom", "")) or props.get(
-            "smtp.from", ""
-        ) or props.get("envelope-from", "")
-        spf_domain = _domain_of(spf_domain) if "@" in spf_domain else spf_domain
-        if _domains_aligned(spf_domain, from_domain):
-            return True, "spf=pass aligned"
-
-    # 3) DKIM pass aligned with the From domain (the signing domain header.d
-    #    must align with the From domain).
     if methods.get("dkim") == "pass":
         dkim_domain = props.get("header.d", "") or _domain_of(props.get("header.from", ""))
         if _domains_aligned(dkim_domain, from_domain):
             return True, "dkim=pass aligned"
 
     return False, f"authentication failed ({trusted[:120]})"
+
+
+def _require_allowed_email_recipient(address: str) -> str:
+    """Return a normalized recipient or fail closed before any SMTP action."""
+    recipient = _extract_email_address(address)
+    allowed = {
+        _extract_email_address(value)
+        for value in os.getenv("EMAIL_ALLOWED_USERS", "").split(",")
+        if value.strip()
+    }
+    if not recipient or recipient not in allowed:
+        raise PermissionError(f"email recipient is not allowlisted: {recipient or '<empty>'}")
+    return recipient
 
 
 def _extract_attachments(
@@ -717,7 +730,10 @@ class EmailAdapter(BasePlatformAdapter):
                     # decided. From: is attacker-controlled, so this is the only
                     # place a spoof can be caught (GHSA-rxqh-5572-8m77).
                     sender_authenticated, auth_reason = _verify_sender_authentication(
-                        msg, sender_addr, authserv_id=self._authserv_id
+                        msg,
+                        sender_addr,
+                        authserv_id=self._authserv_id,
+                        raw_email=bytes(raw_email),
                     )
 
                     body = _extract_text_body(msg)
@@ -925,6 +941,7 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to_msg_id: Optional[str] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
+        to_addr = _require_allowed_email_recipient(to_addr)
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
@@ -1040,6 +1057,7 @@ class EmailAdapter(BasePlatformAdapter):
         file_paths: List[str],
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
+        to_addr = _require_allowed_email_recipient(to_addr)
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
@@ -1120,6 +1138,7 @@ class EmailAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
+        to_addr = _require_allowed_email_recipient(to_addr)
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
@@ -1216,6 +1235,7 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
+        chat_id = _require_allowed_email_recipient(chat_id)
         msg = MIMEText(message, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
@@ -1261,7 +1281,7 @@ def register(ctx) -> None:
         check_fn=check_email_requirements,
         is_connected=_is_connected,
         required_env=["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST"],
-        install_hint="Email uses the Python stdlib (smtplib/imaplib) — no extra deps",
+        install_hint="Email uses bundled IMAP/SMTP support and dkimpy verification",
         allowed_users_env="EMAIL_ALLOWED_USERS",
         allow_all_env="EMAIL_ALLOW_ALL_USERS",
         cron_deliver_env_var="EMAIL_HOME_ADDRESS",

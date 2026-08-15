@@ -369,7 +369,8 @@ class TestThreadContext(unittest.TestCase):
             "message_id": "<original@test.com>",
         }
 
-        with patch("smtplib.SMTP") as mock_smtp:
+        with patch.dict(os.environ, {"EMAIL_ALLOWED_USERS": "user@test.com"}), \
+             patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
@@ -410,7 +411,8 @@ class TestSendMethods(unittest.TestCase):
             tmp_path = f.name
 
         try:
-            with patch("smtplib.SMTP") as mock_smtp:
+            with patch.dict(os.environ, {"EMAIL_ALLOWED_USERS": "user@test.com"}), \
+                 patch("smtplib.SMTP") as mock_smtp:
                 mock_server = MagicMock()
                 mock_smtp.return_value = mock_server
 
@@ -590,6 +592,7 @@ class TestSendEmailStandalone(unittest.TestCase):
         "EMAIL_PASSWORD": "secret",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
+        "EMAIL_ALLOWED_USERS": "user@test.com",
     })
     def test_send_email_tool_success(self):
         """_send_email should use verified STARTTLS when sending."""
@@ -641,6 +644,7 @@ class TestSmtpConnectionCleanup(unittest.TestCase):
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
+        "EMAIL_ALLOWED_USERS": "user@test.com",
     }, clear=False)
     def test_smtp_close_called_when_quit_also_fails(self):
         """If both send_message() and quit() fail, close() is the fallback."""
@@ -845,12 +849,9 @@ class TestConnectionConfigResolution(unittest.TestCase):
 
 
 class TestSenderAuthentication(unittest.TestCase):
-    """Verify _verify_sender_authentication parses Authentication-Results
-    correctly and resists From: spoofing (GHSA-rxqh-5572-8m77)."""
+    """Only cryptographic, From-aligned sender evidence is accepted."""
 
     def _msg(self, from_addr, auth_results=None):
-        """Build an email.message.Message with the given From: and
-        zero or more Authentication-Results headers (first = topmost/trusted)."""
         msg = MIMEText("body")
         msg["From"] = from_addr
         for ar in auth_results or []:
@@ -866,45 +867,132 @@ class TestSenderAuthentication(unittest.TestCase):
         addr = _extract_email_address(from_addr)
         return _verify_sender_authentication(msg, addr, authserv_id=authserv_id)
 
-    def test_dmarc_pass_authenticates(self):
+    def test_dmarc_pass_without_aligned_dkim_is_rejected(self):
         ok, reason = self._verify(
             "Admin <admin@example.com>",
             ["mx.google.com; dmarc=pass header.from=example.com; spf=pass"],
         )
-        self.assertTrue(ok, reason)
+        self.assertFalse(ok, reason)
 
-
-    def test_dkim_pass_aligned_authenticates(self):
+    def test_unpinned_authentication_results_dkim_is_rejected(self):
         ok, reason = self._verify(
             "admin@example.com",
             ["mx.google.com; dkim=pass header.d=example.com"],
         )
-        self.assertTrue(ok, reason)
+        self.assertFalse(ok, reason)
 
-    def test_spf_pass_misaligned_rejected(self):
-        # SPF passes for the envelope domain, but it doesn't match From: domain.
+    def test_pinned_authentication_results_dkim_authenticates(self):
         ok, reason = self._verify(
             "admin@example.com",
-            ["mx.google.com; spf=pass smtp.mailfrom=bounce@evil.com"],
+            ["mx.google.com; dkim=pass header.d=example.com"],
+            authserv_id="mx.google.com",
+        )
+        self.assertTrue(ok, reason)
+
+    def test_spf_pass_aligned_is_rejected(self):
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["mx.google.com; spf=pass smtp.mailfrom=admin@example.com"],
+            authserv_id="mx.google.com",
         )
         self.assertFalse(ok, reason)
 
+    def test_direct_raw_dkim_signature_authenticates(self):
+        import sys
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _verify_sender_authentication
+
+        msg = self._msg("admin@example.com")
+        msg["DKIM-Signature"] = "v=1; d=example.com; s=selector1; b=fake"
+        fake_dkim = SimpleNamespace(verify=lambda raw: True)
+        with patch.dict(sys.modules, {"dkim": fake_dkim}):
+            ok, reason = _verify_sender_authentication(
+                msg, "admin@example.com", raw_email=b"signed raw message"
+            )
+        self.assertTrue(ok, reason)
+        self.assertEqual(reason, "dkim=pass cryptographically verified")
+
+    def test_untrusted_arc_with_aligned_dkim_is_rejected(self):
+        import sys
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _verify_sender_authentication
+
+        msg = self._msg("admin@example.com")
+        fake_dkim = SimpleNamespace(
+            verify=lambda raw: False,
+            arc_verify=lambda raw: (
+                b"pass",
+                [{"aar-value": b"i=1; dkim=pass header.d=example.com"}],
+                "success",
+            ),
+        )
+        with patch.dict(sys.modules, {"dkim": fake_dkim}):
+            ok, reason = _verify_sender_authentication(
+                msg, "admin@example.com", raw_email=b"arc sealed raw message"
+            )
+        self.assertFalse(ok, reason)
 
     def test_injected_header_below_trusted_does_not_authenticate(self):
-        """An attacker-injected Authentication-Results sorts BELOW the receiving
-        server's. With authserv-id pinning, only the trusted (first) header is
-        consulted, so a forged 'dmarc=pass' lower in the stack is ignored."""
         ok, reason = self._verify(
             "admin@example.com",
             [
-                # Trusted: stamped by our server, real verdict = fail
-                "mx.ourserver.com; dmarc=fail header.from=example.com",
-                # Forged by attacker, claims pass
-                "mx.ourserver.com; dmarc=pass header.from=example.com",
+                "mx.ourserver.com; dkim=fail header.d=example.com",
+                "mx.ourserver.com; dkim=pass header.d=example.com",
             ],
             authserv_id="mx.ourserver.com",
         )
         self.assertFalse(ok, reason)
+
+    def test_authserv_id_subdomain_is_not_treated_as_pinned(self):
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["forged.mx.ourserver.com; dkim=pass header.d=example.com"],
+            authserv_id="mx.ourserver.com",
+        )
+        self.assertFalse(ok, reason)
+
+
+class TestOutboundRecipientAllowlist(unittest.TestCase):
+    """Every SMTP path must fail closed outside EMAIL_ALLOWED_USERS."""
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    def test_reply_rejects_recipient_outside_exact_allowlist(self):
+        adapter = self._make_adapter()
+        with patch.dict(os.environ, {
+            "EMAIL_ALLOWED_USERS": "allowed@example.com",
+        }, clear=False), patch("smtplib.SMTP") as mock_smtp:
+            with self.assertRaises(PermissionError):
+                adapter._send_email("other@example.com", "blocked")
+        mock_smtp.assert_not_called()
+
+    def test_standalone_send_rejects_recipient_outside_exact_allowlist(self):
+        import asyncio
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _standalone_send
+
+        config = SimpleNamespace(
+            token=None,
+            api_key=None,
+            extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+        )
+        with patch.dict(os.environ, {
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_ALLOWED_USERS": "allowed@example.com",
+        }, clear=False), patch("smtplib.SMTP") as mock_smtp:
+            result = asyncio.run(_standalone_send(config, "other@example.com", "blocked"))
+        self.assertIn("not allowlisted", result["error"])
+        mock_smtp.assert_not_called()
 
 
 if __name__ == "__main__":
