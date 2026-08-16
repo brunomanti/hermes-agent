@@ -565,6 +565,16 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if _gateway_surface_passes_raw_text(platform):
         return text
 
+    # Local developer diagnostics are appended after the model's response.
+    # They must not become chat/email content. Stripping here preserves any
+    # substantive reply; the silence predicate separately handles a bare
+    # NO_REPLY followed by the same footer.
+    try:
+        from gateway.response_filters import strip_file_mutation_verifier_footer
+        text = strip_file_mutation_verifier_footer(text)
+    except Exception:
+        pass
+
     # Cancellation metadata, not assistant prose. ACP/TUI already suppress
     # this sentinel; chat surfaces should too (#7921).
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
@@ -576,12 +586,25 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+def _gateway_auxiliary_delivery_enabled(platform: Any) -> bool:
+    """Return whether a platform may receive non-final turn messages.
+
+    Email is a reply-only transport. Progress, compaction, review, approval,
+    credit, and other agent-lifecycle messages are operational diagnostics and
+    must never become standalone email replies.
+    """
+    platform_value = getattr(platform, "value", platform)
+    return str(platform_value or "").strip().lower() != "email"
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
     surfaces should not receive transient auxiliary/compression chatter.
     """
+    if not _gateway_auxiliary_delivery_enabled(platform):
+        return None
     text = str(message or "").strip()
     if not text:
         return None
@@ -8940,6 +8963,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
+                if not _gateway_auxiliary_delivery_enabled(platform):
+                    logger.info(
+                        "Shutdown notification suppressed for final-answer-only platform: %s",
+                        platform_str,
+                    )
+                    continue
                 adapter = self.adapters.get(platform)
                 if not adapter:
                     continue
@@ -9029,6 +9058,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
+            if not _gateway_auxiliary_delivery_enabled(platform):
+                continue
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
@@ -20149,6 +20180,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             platform = Platform(platform_str)
+            if not _gateway_auxiliary_delivery_enabled(platform):
+                logger.info(
+                    "Restart notification suppressed for final-answer-only platform: %s",
+                    platform_str,
+                )
+                return None
             transport = resolve_delivery_transport(platform, self.config, self.adapters)
             if transport is None:
                 logger.debug(
@@ -20226,6 +20263,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, platform_cfg in self.config.platforms.items():
+            if not _gateway_auxiliary_delivery_enabled(platform):
+                continue
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue
@@ -23636,7 +23675,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
+        _status_adapter = (
+            self._adapter_for_source(source)
+            if _gateway_auxiliary_delivery_enabled(source.platform)
+            else None
+        )
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are

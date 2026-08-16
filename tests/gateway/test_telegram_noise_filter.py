@@ -7,10 +7,62 @@ from agent.conversation_compression import (
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
 from gateway.config import Platform
+from gateway.response_filters import is_intentional_silence_response
 from gateway.run import (
+    _gateway_auxiliary_delivery_enabled,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
+
+
+@pytest.mark.parametrize(
+    ("event_type", "message"),
+    [
+        ("compacted", "✓ Context compaction complete — continuing turn..."),
+        ("lifecycle", "🗜️ Compacting context — summarizing earlier conversation so I can continue..."),
+        ("review", "💾 Self-improvement review: patched a skill"),
+        ("approval", "Approve command execution?"),
+    ],
+)
+def test_email_suppresses_all_auxiliary_turn_messages(event_type, message):
+    assert not _gateway_auxiliary_delivery_enabled(Platform.EMAIL)
+    assert _prepare_gateway_status_message(Platform.EMAIL, event_type, message) is None
+
+
+def test_email_question_answer_then_internal_diagnostics_produces_one_payload():
+    """A normal answer must not be followed by Hermes diagnostics over Email."""
+    payloads = []
+    answer = _sanitize_gateway_final_response(
+        Platform.EMAIL,
+        "The requested article is available at the link above.",
+    )
+    payloads.append(answer)
+
+    for event_type, message in (
+        ("compacted", "✓ Context compaction complete — continuing turn..."),
+        ("review", "💾 Self-improvement review: patched a skill"),
+        ("approval", "Approve command execution?"),
+    ):
+        status = _prepare_gateway_status_message(Platform.EMAIL, event_type, message)
+        if status is not None:
+            payloads.append(status)
+
+    verifier_footer = (
+        "⚠️ File-mutation verifier: 2 file(s) were NOT modified this turn despite "
+        "any wording above that may suggest otherwise. Run `git status` or "
+        "`read_file` to confirm.\n"
+        "  • `/tmp/a` — [patch] failed\n"
+        "  • `/tmp/b` — [patch] failed"
+    )
+    post_answer = _sanitize_gateway_final_response(
+        Platform.EMAIL,
+        "NO_REPLY\n\n" + verifier_footer,
+    )
+    if not is_intentional_silence_response(post_answer):
+        payloads.append(post_answer)
+
+    assert payloads == ["The requested article is available at the link above."]
+
 
 # Every human-facing chat surface that must receive noise-filtered,
 # secret-redacted, provider-error-sanitized output (not just Telegram).

@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -22,6 +23,28 @@ LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "NO_REPLY",
     "NO REPLY",
 })
+
+_FILE_MUTATION_VERIFIER_FOOTER_RE = re.compile(
+    r"(?:\n{1,2})?^[ \t]*"
+    r"⚠️ File-mutation verifier: [1-9]\d* file\(s\) were NOT modified this turn "
+    r"despite any wording above that may suggest otherwise\. Run `git status` or "
+    r"`read_file` to confirm\."
+    r"\n[ \t]+•[^\n]*(?:\n[\s\S]*)?\Z",
+    re.MULTILINE,
+)
+
+
+def strip_file_mutation_verifier_footer(response: Any) -> Any:
+    """Remove the trusted turn-finalizer diagnostic from outbound text.
+
+    The verifier is useful in local developer UIs, but it is not assistant
+    prose and must not leak into gateway replies. Removing it before silence
+    detection also prevents ``NO_REPLY`` from becoming deliverable merely
+    because the finalizer appended a diagnostic after the marker.
+    """
+    if not isinstance(response, str):
+        return response
+    return _FILE_MUTATION_VERIFIER_FOOTER_RE.sub("", response).rstrip()
 
 
 def _canonical_silence_candidate(text: str) -> str:
@@ -62,7 +85,7 @@ def is_intentional_silence_response(response: Any) -> bool:
     """
     if not isinstance(response, str):
         return False
-    stripped = response.strip()
+    stripped = strip_file_mutation_verifier_footer(response).strip()
     if not stripped:
         return False
     if len(stripped) > 64:

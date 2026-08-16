@@ -1,5 +1,6 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -30,6 +31,32 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     gateway_run._clear_planned_restart_notification()
 
     assert gateway_run._planned_restart_notification_pending() is False
+
+
+def test_email_restart_completion_marker_is_consumed_without_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".restart_notify.json"
+    marker.write_text(json.dumps({
+        "platform": "email",
+        "chat_id": "brian@example.com",
+        "chat_type": "dm",
+    }))
+
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.EMAIL: adapter}
+    runner.config.platforms = {
+        Platform.EMAIL: PlatformConfig(
+            enabled=True,
+            gateway_restart_notification=True,
+        )
+    }
+    adapter.send = AsyncMock()
+
+    delivered_target = asyncio.run(runner._send_restart_notification())
+
+    assert delivered_target is None
+    adapter.send.assert_not_awaited()
+    assert not marker.exists()
 
 
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
@@ -390,6 +417,28 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
         metadata={"thread_id": "topic-7"},
     )
+
+
+def test_email_shutdown_notification_stays_silent_even_if_generic_flag_enabled():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="brian@example.com")
+    source.platform = Platform.EMAIL
+    session_key = build_session_key(source)
+
+    runner.adapters = {Platform.EMAIL: adapter}
+    runner.config.platforms = {
+        Platform.EMAIL: PlatformConfig(
+            enabled=True,
+            gateway_restart_notification=True,
+        )
+    }
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock()
+
+    asyncio.run(runner._notify_active_sessions_of_shutdown())
+
+    adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
